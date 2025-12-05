@@ -1,39 +1,220 @@
 // script.js
 
+// === SECURITY UTILITIES ===
+const Security = {
+    // Hash password using SHA-256
+    async hashPassword(password) {
+        const encoder = new TextEncoder();
+        const data = encoder.encode(password);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    },
+
+    // Generate random OTP
+    generateOTP() {
+        return Math.floor(100000 + Math.random() * 900000).toString();
+    },
+
+    // Validate password strength
+    validatePassword(password) {
+        if (password.length < 6) return { valid: false, msg: 'Mật khẩu phải có ít nhất 6 ký tự' };
+        return { valid: true };
+    },
+
+    // Validate PIN
+    validatePIN(pin) {
+        if (!/^\d{6}$/.test(pin)) return { valid: false, msg: 'PIN phải là 6 chữ số' };
+        return { valid: true };
+    }
+};
+
 // === BANK DATA LOGIC (MODEL) ===
 class BankModel {
     constructor() {
         this.db = JSON.parse(localStorage.getItem('quocbank_v3')) || { accounts: {} };
         this.currentUser = null;
+        this.sessionTimeout = null;
+        this.SESSION_DURATION = 15 * 60 * 1000; // 15 minutes
+        this.LOCK_DURATION = 5 * 60 * 1000; // 5 minutes
+        this.initSession();
+        this.migrateOldAccounts();
+    }
+
+    // Migrate old accounts to new security structure
+    async migrateOldAccounts() {
+        let needsSave = false;
+        for (let id in this.db.accounts) {
+            const acc = this.db.accounts[id];
+            // Check if password is not hashed (old format)
+            if (acc.pass && acc.pass.length < 64) {
+                acc.pass = await Security.hashPassword(acc.pass);
+                needsSave = true;
+            }
+            // Add new security fields if missing
+            if (!acc.loginAttempts) acc.loginAttempts = 0;
+            if (!acc.lockedUntil) acc.lockedUntil = null;
+            if (!acc.pin) acc.pin = null;
+            if (!acc.dailyLimit) acc.dailyLimit = 50000000;
+            if (!acc.dailySpent) acc.dailySpent = 0;
+            if (!acc.lastResetDate) acc.lastResetDate = new Date().toDateString();
+            if (!acc.email) acc.email = '';
+            if (!acc.phone) acc.phone = '';
+            if (!acc.address) acc.address = '';
+            if (!acc.avatar) acc.avatar = '';
+            if (!acc.beneficiaries) acc.beneficiaries = [];
+            if (!acc.createdAt) acc.createdAt = new Date().toISOString();
+        }
+        if (needsSave) this.save();
+    }
+
+    // Session management
+    initSession() {
+        this.resetSessionTimeout();
+        // Check for activity
+        ['mousedown', 'keydown', 'scroll', 'touchstart'].forEach(event => {
+            document.addEventListener(event, () => this.resetSessionTimeout());
+        });
+    }
+
+    resetSessionTimeout() {
+        if (this.sessionTimeout) clearTimeout(this.sessionTimeout);
+        if (this.currentUser) {
+            this.sessionTimeout = setTimeout(() => {
+                app.notify('Phiên làm việc đã hết hạn. Vui lòng đăng nhập lại.', 'error');
+                app.logout();
+            }, this.SESSION_DURATION);
+        }
     }
 
     save() { localStorage.setItem('quocbank_v3', JSON.stringify(this.db)); }
 
-    createAccount(name, pass, balance) {
+    // Create new account with hashed password
+    async createAccount(name, pass, balance) {
+        const validation = Security.validatePassword(pass);
+        if (!validation.valid) return { success: false, msg: validation.msg };
+
         const id = Math.floor(100000 + Math.random() * 900000).toString();
+        const hashedPass = await Security.hashPassword(pass);
+        
         this.db.accounts[id] = {
-            id, name, pass, // Lưu ý: Demo nên chưa hash kỹ
+            id, 
+            name, 
+            pass: hashedPass,
             balance: parseFloat(balance),
-            history: [{ type: 'create', amount: parseFloat(balance), desc: 'Khởi tạo tài khoản', date: new Date().toISOString() }]
+            history: [{ 
+                type: 'create', 
+                amount: parseFloat(balance), 
+                desc: 'Khởi tạo tài khoản', 
+                date: new Date().toISOString(),
+                balance: parseFloat(balance)
+            }],
+            // Security fields
+            pin: null,
+            loginAttempts: 0,
+            lockedUntil: null,
+            // Profile fields
+            email: '',
+            phone: '',
+            address: '',
+            avatar: '',
+            // Transaction limits
+            dailyLimit: 50000000,
+            dailySpent: 0,
+            lastResetDate: new Date().toDateString(),
+            // Beneficiaries
+            beneficiaries: [],
+            createdAt: new Date().toISOString()
         };
         this.save();
-        return id;
+        return { success: true, id };
     }
 
-    login(id, pass) {
+    // Login with security checks
+    async login(id, pass) {
         const acc = this.db.accounts[id];
-        if (acc && acc.pass === pass) {
-            this.currentUser = id;
-            return acc;
+        if (!acc) return { success: false, msg: 'Tài khoản không tồn tại' };
+
+        // Check if account is locked
+        if (acc.lockedUntil && new Date() < new Date(acc.lockedUntil)) {
+            const remainingTime = Math.ceil((new Date(acc.lockedUntil) - new Date()) / 1000 / 60);
+            return { success: false, msg: `Tài khoản bị khóa. Vui lòng thử lại sau ${remainingTime} phút.` };
         }
-        return null;
+
+        // Hash input password and compare
+        const hashedPass = await Security.hashPassword(pass);
+        if (acc.pass === hashedPass) {
+            // Reset login attempts on successful login
+            acc.loginAttempts = 0;
+            acc.lockedUntil = null;
+            this.currentUser = id;
+            this.resetSessionTimeout();
+            this.save();
+            return { success: true, account: acc };
+        } else {
+            // Increment login attempts
+            acc.loginAttempts = (acc.loginAttempts || 0) + 1;
+            
+            if (acc.loginAttempts >= 5) {
+                acc.lockedUntil = new Date(Date.now() + this.LOCK_DURATION).toISOString();
+                this.save();
+                return { success: false, msg: 'Sai mật khẩu 5 lần. Tài khoản bị khóa 5 phút.' };
+            }
+            
+            this.save();
+            return { success: false, msg: `Sai mật khẩu. Còn ${5 - acc.loginAttempts} lần thử.` };
+        }
     }
 
-    logout() { this.currentUser = null; }
+    // Set PIN for account
+    async setPIN(pin) {
+        const validation = Security.validatePIN(pin);
+        if (!validation.valid) return { success: false, msg: validation.msg };
+
+        const user = this.getAccount();
+        if (!user) return { success: false, msg: 'Vui lòng đăng nhập' };
+
+        user.pin = await Security.hashPassword(pin);
+        this.save();
+        return { success: true, msg: 'Đặt PIN thành công!' };
+    }
+
+    // Verify PIN
+    async verifyPIN(pin) {
+        const user = this.getAccount();
+        if (!user) return false;
+        if (!user.pin) return { success: false, msg: 'Bạn chưa đặt PIN. Vui lòng đặt PIN trước.' };
+
+        const hashedPin = await Security.hashPassword(pin);
+        return user.pin === hashedPin;
+    }
+
+    // Change password
+    async changePassword(oldPass, newPass) {
+        const user = this.getAccount();
+        if (!user) return { success: false, msg: 'Vui lòng đăng nhập' };
+
+        const oldHashed = await Security.hashPassword(oldPass);
+        if (user.pass !== oldHashed) {
+            return { success: false, msg: 'Mật khẩu cũ không đúng' };
+        }
+
+        const validation = Security.validatePassword(newPass);
+        if (!validation.valid) return { success: false, msg: validation.msg };
+
+        user.pass = await Security.hashPassword(newPass);
+        this.save();
+        return { success: true, msg: 'Đổi mật khẩu thành công!' };
+    }
+
+    logout() { 
+        this.currentUser = null;
+        if (this.sessionTimeout) clearTimeout(this.sessionTimeout);
+    }
 
     getAccount() { return this.currentUser ? this.db.accounts[this.currentUser] : null; }
 
-    transfer(toId, amount) {
+    transfer(toId, amount, note = '') {
         const user = this.getAccount();
         const receiver = this.db.accounts[toId];
         amount = parseFloat(amount);
@@ -42,30 +223,88 @@ class BankModel {
         if (!receiver) return { s: false, m: 'Người nhận không tồn tại' };
         if (toId === user.id) return { s: false, m: 'Không thể tự chuyển cho mình' };
 
+        // Check daily limit
+        this.resetDailyLimitIfNeeded(user);
+        if (user.dailySpent + amount > user.dailyLimit) {
+            return { s: false, m: `Vượt hạn mức giao dịch hàng ngày (${app.formatMoney(user.dailyLimit)})` };
+        }
+
         user.balance -= amount;
         receiver.balance += amount;
+        user.dailySpent += amount;
 
         const date = new Date().toISOString();
-        user.history.unshift({ type: 'expense', amount: amount, desc: `Chuyển đến ${receiver.name} (${toId})`, date });
-        receiver.history.unshift({ type: 'income', amount: amount, desc: `Nhận từ ${user.name} (${user.id})`, date });
+        const noteText = note ? ` - ${note}` : '';
+        
+        user.history.unshift({ 
+            type: 'expense', 
+            amount: amount, 
+            desc: `Chuyển đến ${receiver.name} (${toId})${noteText}`, 
+            note: note,
+            date,
+            balance: user.balance
+        });
+        
+        receiver.history.unshift({ 
+            type: 'income', 
+            amount: amount, 
+            desc: `Nhận từ ${user.name} (${user.id})${noteText}`, 
+            note: note,
+            date,
+            balance: receiver.balance
+        });
         
         this.save();
         return { s: true, m: 'Chuyển khoản thành công!' };
     }
 
-    updateBalance(type, amount) {
+    // Reset daily spending if new day
+    resetDailyLimitIfNeeded(user) {
+        const today = new Date().toDateString();
+        if (user.lastResetDate !== today) {
+            user.dailySpent = 0;
+            user.lastResetDate = today;
+        }
+    }
+
+    updateBalance(type, amount, note = '') {
         const user = this.getAccount();
         amount = parseFloat(amount);
         if (amount <= 0) return { s: false, m: 'Số tiền không hợp lệ' };
         
         if (type === 'withdraw' && user.balance < amount) return { s: false, m: 'Số dư không đủ' };
 
+        // Check daily limit for withdrawals
+        if (type === 'withdraw') {
+            this.resetDailyLimitIfNeeded(user);
+            if (user.dailySpent + amount > user.dailyLimit) {
+                return { s: false, m: `Vượt hạn mức giao dịch hàng ngày (${app.formatMoney(user.dailyLimit)})` };
+            }
+        }
+
+        const noteText = note ? ` - ${note}` : '';
+
         if (type === 'withdraw') {
             user.balance -= amount;
-            user.history.unshift({ type: 'expense', amount, desc: 'Rút tiền mặt', date: new Date().toISOString() });
+            user.dailySpent += amount;
+            user.history.unshift({ 
+                type: 'expense', 
+                amount, 
+                desc: `Rút tiền mặt${noteText}`, 
+                note: note,
+                date: new Date().toISOString(),
+                balance: user.balance
+            });
         } else {
             user.balance += amount;
-            user.history.unshift({ type: 'income', amount, desc: 'Nạp tiền vào tài khoản', date: new Date().toISOString() });
+            user.history.unshift({ 
+                type: 'income', 
+                amount, 
+                desc: `Nạp tiền vào tài khoản${noteText}`, 
+                note: note,
+                date: new Date().toISOString(),
+                balance: user.balance
+            });
         }
         this.save();
         return { s: true, m: 'Giao dịch thành công!' };
@@ -82,28 +321,32 @@ const app = {
     },
 
     bindEvents: () => {
-        document.getElementById('login-form').onsubmit = (e) => {
+        document.getElementById('login-form').onsubmit = async (e) => {
             e.preventDefault();
             const id = document.getElementById('login-id').value;
             const pass = document.getElementById('login-pass').value;
-            const acc = bank.login(id, pass);
-            if (acc) {
-                app.notify('Chào mừng ' + acc.name + ' quay trở lại!', 'success');
+            const result = await bank.login(id, pass);
+            if (result.success) {
+                app.notify('Chào mừng ' + result.account.name + ' quay trở lại!', 'success');
                 app.renderDashboard();
             } else {
-                app.notify('Sai thông tin đăng nhập!', 'error');
+                app.notify(result.msg, 'error');
             }
         };
 
-        document.getElementById('register-form').onsubmit = (e) => {
+        document.getElementById('register-form').onsubmit = async (e) => {
             e.preventDefault();
             const name = document.getElementById('reg-name').value;
             const pass = document.getElementById('reg-pass').value;
             const bal = document.getElementById('reg-balance').value;
-            const id = bank.createAccount(name, pass, bal);
-            app.notify(`Tạo thành công! STK của bạn là: ${id}`, 'success');
-            app.switchAuth('login');
-            document.getElementById('login-id').value = id;
+            const result = await bank.createAccount(name, pass, bal);
+            if (result.success) {
+                app.notify(`Tạo thành công! STK của bạn là: ${result.id}`, 'success');
+                app.switchAuth('login');
+                document.getElementById('login-id').value = result.id;
+            } else {
+                app.notify(result.msg, 'error');
+            }
         };
     },
 
@@ -196,7 +439,11 @@ const app = {
                         <i class="fa-solid fa-money-bill-1-wave"></i>
                         <input type="number" id="action-amount" placeholder="Nhập số tiền">
                     </div>
-                    <button class="btn-glow" onclick="app.handleAction('${tab}')">XÁC NHAN GIAO DỊCH</button>
+                    <div class="input-group">
+                        <i class="fa-solid fa-note-sticky"></i>
+                        <input type="text" id="action-note" placeholder="Ghi chú (tùy chọn)">
+                    </div>
+                    <button class="btn-glow" onclick="app.handleAction('${tab}')">XÁC NHẬN GIAO DỊCH</button>
                 </div>
             `;
         } else if (tab === 'history') {
@@ -225,12 +472,13 @@ const app = {
 
     handleAction: (type) => {
         const amt = document.getElementById('action-amount').value;
+        const note = document.getElementById('action-note')?.value || '';
         let res;
         if (type === 'transfer') {
             const dest = document.getElementById('action-dest').value;
-            res = bank.transfer(dest, amt);
+            res = bank.transfer(dest, amt, note);
         } else {
-            res = bank.updateBalance(type, amt);
+            res = bank.updateBalance(type, amt, note);
         }
 
         if (res.s) {
